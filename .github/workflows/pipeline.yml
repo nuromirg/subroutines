@@ -1,0 +1,20 @@
+name: ci
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    types:
+      - opened
+      - synchronize
+
+jobs:
+  pipe:
+    timeout-minutes: 15
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: true
+    uses: platform-mesh/.github/.github/workflows/pipeline-golang-module.yml@main
+    secrets: inherit
+    with:
+      useLocalCoverageConfig: true
