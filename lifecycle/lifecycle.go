@@ -337,7 +337,7 @@ func (l *Lifecycle) Reconcile(ctx context.Context, req mcreconcile.Request) (rec
 	}
 
 	// Update spread state.
-	if l.spread != nil && !isDeleting && subroutineErr == nil {
+	if l.spread != nil && !isDeleting && subroutineErr == nil && !hasStopped && minRequeue == 0 {
 		l.spread.UpdateObservedGeneration(obj)
 		l.spread.SetNextReconcileTime(obj)
 		if l.spread.RemoveRefreshLabel(obj) {
