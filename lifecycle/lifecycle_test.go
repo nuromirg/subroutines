@@ -1010,3 +1010,160 @@ func TestClusterFromContext_Error(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "resolving cluster client")
 }
+
+// TestProgressiveStatus_FlushesAfterEachSubroutine verifies that when
+// WithProgressiveStatus is enabled, the lifecycle writes the current in-memory
+// status to the API server after each subroutine completes — before the next
+// one runs.
+func TestProgressiveStatus_FlushesAfterEachSubroutine(t *testing.T) {
+	obj := newTestObj("test", "default")
+	cl := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(obj).WithStatusSubresource(obj).Build()
+
+	// sub1 writes a sentinel value to status. sub2 verifies it is already
+	// visible in the API server before sub2 executes.
+	var statusFlushedBeforeSub2 bool
+
+	sub1 := &processorSub{
+		name: "sub1",
+		fn: func(_ context.Context, obj client.Object) (subroutines.Result, error) {
+			obj.(*testObject).Status.ObservedGen = 42
+			return subroutines.OK(), nil
+		},
+	}
+	sub2 := &processorSub{
+		name: "sub2",
+		fn: func(ctx context.Context, _ client.Object) (subroutines.Result, error) {
+			fetched := &testObject{}
+			if err := cl.Get(ctx, types.NamespacedName{Name: "test", Namespace: "default"}, fetched); err != nil {
+				return subroutines.Stop("get failed"), err
+			}
+			statusFlushedBeforeSub2 = fetched.Status.ObservedGen == 42
+			return subroutines.OK(), nil
+		},
+	}
+
+	lc := setupLifecycle(cl, sub1, sub2).WithProgressiveStatus()
+	_, err := lc.Reconcile(context.Background(), newReq("test", "default"))
+	require.NoError(t, err)
+	assert.True(t, statusFlushedBeforeSub2, "status must be flushed to the API server before sub2 runs")
+}
+
+// TestProgressiveStatus_FlushesOnError verifies that when WithProgressiveStatus
+// is enabled and a subroutine errors, the error condition is flushed to the API
+// server immediately — not deferred to the end-of-reconciliation patchChanges.
+func TestProgressiveStatus_FlushesOnError(t *testing.T) {
+	obj := newTestObj("test", "default")
+	cl := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(obj).WithStatusSubresource(obj).Build()
+
+	sub1 := &processorSub{
+		name: "sub1",
+		fn: func(_ context.Context, obj client.Object) (subroutines.Result, error) {
+			obj.(*testObject).Status.ObservedGen = 99
+			return subroutines.Stop("failed"), errors.New("sub1 error")
+		},
+	}
+
+	lc := setupLifecycle(cl, sub1).WithProgressiveStatus()
+	_, err := lc.Reconcile(context.Background(), newReq("test", "default"))
+	require.Error(t, err)
+
+	fetched := &testObject{}
+	require.NoError(t, cl.Get(context.Background(), types.NamespacedName{Name: "test", Namespace: "default"}, fetched))
+	assert.Equal(t, int64(99), fetched.Status.ObservedGen, "error condition must be flushed immediately in progressive mode")
+}
+
+// TestProgressiveStatus_ChainStopsOnError verifies that sub2 never runs when
+// sub1 errors, even in progressive mode.
+func TestProgressiveStatus_ChainStopsOnError(t *testing.T) {
+	obj := newTestObj("test", "default")
+	cl := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(obj).WithStatusSubresource(obj).Build()
+
+	sub2Called := false
+
+	sub1 := &processorSub{
+		name: "sub1",
+		fn: func(_ context.Context, obj client.Object) (subroutines.Result, error) {
+			obj.(*testObject).Status.ObservedGen = 99
+			return subroutines.Stop("intentional stop"), errors.New("sub1 error")
+		},
+	}
+	sub2 := &processorSub{
+		name: "sub2",
+		fn: func(context.Context, client.Object) (subroutines.Result, error) {
+			sub2Called = true
+			return subroutines.OK(), nil
+		},
+	}
+
+	lc := setupLifecycle(cl, sub1, sub2).WithProgressiveStatus()
+	_, err := lc.Reconcile(context.Background(), newReq("test", "default"))
+	require.Error(t, err)
+	assert.False(t, sub2Called, "sub2 must not run when sub1 errors")
+}
+
+// TestProgressiveStatus_DisabledByDefault verifies that without
+// WithProgressiveStatus, status is NOT flushed between subroutines.
+func TestProgressiveStatus_DisabledByDefault(t *testing.T) {
+	obj := newTestObj("test", "default")
+	cl := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(obj).WithStatusSubresource(obj).Build()
+
+	var statusFlushedBeforeSub2 bool
+
+	sub1 := &processorSub{
+		name: "sub1",
+		fn: func(_ context.Context, obj client.Object) (subroutines.Result, error) {
+			obj.(*testObject).Status.ObservedGen = 42
+			return subroutines.OK(), nil
+		},
+	}
+	sub2 := &processorSub{
+		name: "sub2",
+		fn: func(ctx context.Context, _ client.Object) (subroutines.Result, error) {
+			fetched := &testObject{}
+			if err := cl.Get(ctx, types.NamespacedName{Name: "test", Namespace: "default"}, fetched); err != nil {
+				return subroutines.Stop("get failed"), err
+			}
+			statusFlushedBeforeSub2 = fetched.Status.ObservedGen == 42
+			return subroutines.OK(), nil
+		},
+	}
+
+	// No WithProgressiveStatus — flush should NOT happen between subroutines.
+	lc := setupLifecycle(cl, sub1, sub2)
+	_, err := lc.Reconcile(context.Background(), newReq("test", "default"))
+	require.NoError(t, err)
+	assert.False(t, statusFlushedBeforeSub2, "status must not be flushed between subroutines without WithProgressiveStatus")
+}
+
+// TestProgressiveStatus_ReadOnlyMode verifies that no flush happens in read-only mode
+// even when WithProgressiveStatus is enabled.
+func TestProgressiveStatus_ReadOnlyMode(t *testing.T) {
+	obj := newTestObj("test", "default")
+	cl := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(obj).WithStatusSubresource(obj).Build()
+
+	var sub2SeesFlush bool
+
+	sub1 := &processorSub{
+		name: "sub1",
+		fn: func(_ context.Context, obj client.Object) (subroutines.Result, error) {
+			obj.(*testObject).Status.ObservedGen = 77
+			return subroutines.OK(), nil
+		},
+	}
+	sub2 := &processorSub{
+		name: "sub2",
+		fn: func(ctx context.Context, _ client.Object) (subroutines.Result, error) {
+			fetched := &testObject{}
+			if err := cl.Get(ctx, types.NamespacedName{Name: "test", Namespace: "default"}, fetched); err != nil {
+				return subroutines.Stop("get failed"), err
+			}
+			sub2SeesFlush = fetched.Status.ObservedGen == 77
+			return subroutines.OK(), nil
+		},
+	}
+
+	lc := setupLifecycle(cl, sub1, sub2).WithProgressiveStatus().WithReadOnly()
+	_, err := lc.Reconcile(context.Background(), newReq("test", "default"))
+	require.NoError(t, err)
+	assert.False(t, sub2SeesFlush, "status must not be flushed in read-only mode")
+}

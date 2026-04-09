@@ -43,14 +43,15 @@ type Lifecycle struct {
 	controllerName string
 	subroutines    []subroutines.Subroutine
 
-	conditions     ConditionManager
-	spread         SpreadManager
-	errorReporters []ErrorReporter
-	prepareCtx     func(ctx context.Context, obj client.Object) (context.Context, error)
-	readOnly       bool
-	specPatch      bool
-	initializer    string
-	terminator     string
+	conditions        ConditionManager
+	spread            SpreadManager
+	errorReporters    []ErrorReporter
+	prepareCtx        func(ctx context.Context, obj client.Object) (context.Context, error)
+	readOnly          bool
+	specPatch         bool
+	progressiveStatus bool
+	initializer       string
+	terminator        string
 }
 
 // New creates a Lifecycle for the given controller.
@@ -109,7 +110,20 @@ func (l *Lifecycle) WithSpecPatch() *Lifecycle {
 	return l
 }
 
-// WithInitializer enables initializer support. When the given name is present in
+// WithProgressiveStatus enables an intermediate status flush after every subroutine
+// that completes (successfully or with error). this makes status changes visible to
+// external observers as each subroutine runs rather than batching all changes until
+// the end of reconciliation.
+//
+// use this when your controller uses status fields (e.g. stage conditions) that
+// external systems observe in near-real-time. each flush adds one extra API call
+// per subroutine, so only enable it when progressive visibility is genuinely required.
+func (l *Lifecycle) WithProgressiveStatus() *Lifecycle {
+	l.progressiveStatus = true
+	return l
+}
+
+// WithInitializer enables initializer support. when the given name is present in
 // status.initializers (set by kcp), subroutines implementing Initializer will run
 // Initialize instead of Process. The marker is removed from status once all
 // subroutines complete successfully.
@@ -148,7 +162,10 @@ func (l *Lifecycle) Reconcile(ctx context.Context, req mcreconcile.Request) (rec
 		return reconcile.Result{}, fmt.Errorf("fetching object: %w", err)
 	}
 
-	original := obj.DeepCopyObject().(client.Object)
+	original, err := deepCopy(obj)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
 	isDeleting := obj.GetDeletionTimestamp() != nil
 	generation := obj.GetGeneration()
 
@@ -253,6 +270,13 @@ func (l *Lifecycle) Reconcile(ctx context.Context, req mcreconcile.Request) (rec
 				})
 			}
 			subroutineErr = err
+			// in progressive mode, flush the error condition immediately so
+			// external observers see the failure state before we return.
+			if l.progressiveStatus && !l.readOnly {
+				if flushErr := l.flushStatus(ctx, cl, original, obj); flushErr != nil {
+					log.FromContext(ctx).Error(flushErr, "failed to flush status after subroutine error", "subroutine", sub.GetName())
+				}
+			}
 			break
 		}
 
@@ -260,7 +284,23 @@ func (l *Lifecycle) Reconcile(ctx context.Context, req mcreconcile.Request) (rec
 			l.conditions.SetSubroutineCondition(obj, sub.GetName(), result, nil, actionName.IsFinalize())
 		}
 
-		// Track min requeue across all subroutines — the shortest duration wins
+		// in progressive mode, flush the current in-memory status to the API server
+		// after each successful subroutine so external observers see stage changes as
+		// the chain advances rather than only at the end of reconciliation.
+		if l.progressiveStatus && !l.readOnly {
+			if err := l.flushStatus(ctx, cl, original, obj); err != nil {
+				return reconcile.Result{}, fmt.Errorf("flushing status after %s: %w", sub.GetName(), err)
+			}
+
+			// advance original to the post-flush state so patchChanges only diffs
+			// changes that occur after this point.
+			original, err = deepCopy(obj)
+			if err != nil {
+				return reconcile.Result{}, fmt.Errorf("deep copying object after flush: %w", err)
+			}
+		}
+
+		// track min requeue across all subroutines, the shortest duration wins
 		// regardless of result type (OK, Pending, or StopWithRequeue).
 		if d := result.Requeue(); d > 0 {
 			if minRequeue == 0 || d < minRequeue {
@@ -409,9 +449,41 @@ func (l *Lifecycle) addFinalizers(ctx context.Context, cl client.Client, obj cli
 	if len(missing) == 0 {
 		return false, nil
 	}
-	patch := client.MergeFrom(obj.DeepCopyObject().(client.Object))
+	original, err := deepCopy(obj)
+	if err != nil {
+		return false, err
+	}
+	patch := client.MergeFrom(original)
 	obj.SetFinalizers(append(current, missing...))
 	return true, cl.Patch(ctx, obj, patch)
+}
+
+// flushStatus writes the current in-memory status to the API server using a targeted
+// status patch. conflict errors are silently ignored, andd the final patchChanges call at
+// the end of reconciliation will reconcile any remaining diff.
+func (l *Lifecycle) flushStatus(ctx context.Context, cl client.Client, original, current client.Object) error {
+	origData, err := toUnstructuredMap(original)
+	if err != nil {
+		return fmt.Errorf("converting original to unstructured: %w", err)
+	}
+	currData, err := toUnstructuredMap(current)
+	if err != nil {
+		return fmt.Errorf("converting current to unstructured: %w", err)
+	}
+
+	if equality.Semantic.DeepEqual(getMap(origData, "status"), getMap(currData, "status")) {
+		return nil
+	}
+
+	patch := client.MergeFrom(original)
+	if err := cl.Status().Patch(ctx, current, patch); err != nil {
+		if apierrors.IsConflict(err) {
+			log.FromContext(ctx).V(1).Info("conflict during intermediate status flush, will retry at end of reconciliation", "resourceVersion", current.GetResourceVersion())
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 func (l *Lifecycle) patchChanges(ctx context.Context, cl client.Client, original, current client.Object) error {
@@ -479,6 +551,17 @@ func getMap(data map[string]any, key string) map[string]any {
 		}
 	}
 	return nil
+}
+
+// deepCopy returns a deep copy of obj as a client.Object.
+// returns an error if the copied object does not implement client.Object,
+// which should never happen for a well-formed Kubernetes resource.
+func deepCopy(obj client.Object) (client.Object, error) {
+	copied, ok := obj.DeepCopyObject().(client.Object)
+	if !ok {
+		return nil, fmt.Errorf("deep copy of %T does not implement client.Object", obj)
+	}
+	return copied, nil
 }
 
 func (l *Lifecycle) mustImplement(iface string, check func(client.Object) bool) {
